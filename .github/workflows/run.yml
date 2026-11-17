@@ -1,0 +1,136 @@
+name: relay-node
+# follower 薄壳节点 N2b=xm921016/relay-node（SOP：文档\多账号扇出与D1额度优化方案-20261111.md §5.2，
+# 2026-11-17 建。「主仓转私密+播放外移」Phase 1：master 与 N2 对半分不动，本仓灰度先接 master 末 2 片，
+# 全绿后升阶段二：master 0 片、本仓接 0..fs_lo-1、N2 保持 fs_lo..ns-1。同账号部署不新增连坐风险。）
+# 设计：本仓只有一个 workflow 文件；run.py/signin.py/notes.py 等代码从主仓跨仓 checkout，
+# 永远只维护主仓一份（§5.8）。改代码只推主仓，本仓不用动。
+# 触发：仅 workflow_dispatch，由 master plan 派发（灰度期手动 dispatch）。
+# ⚠ 故意不放 plan / d1_backup / snapshot / backfill / guard / coverage（§4.4 #3/#4/#5：
+#   workflow_run 下游会在 follower 上各跑一遍 → 5 份快照 5 份备份；guard 会把全部 ns 片拉起来）。
+# ⚠ 不配 schedule：两个触发源会各跑一遍。
+# ⚠ 不加 pull_request 触发（public 仓任何人可提 PR，防注入）。
+on:
+  workflow_dispatch:
+    inputs:
+      ns_override:
+        description: '强制片数（必须与 master 当轮 ns 完全一致，否则分片键全变 → 大面重复+漏播）'
+        required: true
+      day_override:
+        description: '强制 ASSIGN_DAY（北京日期，如 2026-11-14）'
+        required: true
+      par_override:
+        description: 'master plan 算出的 ACCOUNT_PARALLEL（忘传落 run.py 默认 3 → 单片撞 6h 被 cancel）'
+        required: true
+      only_slices:
+        description: '本仓认领的片号，逗号分隔，如 30,31,32（必须与 master 的矩阵互斥且并集=0..ns-1）'
+        required: true
+
+concurrency:
+  # 带日期：防 master 误重发时排在昨天那轮后面隔夜跑
+  # 加 016 后缀：本仓与 master 同账号（xm921016），组名虽按 repo 隔离仍显式区分便于排查
+  group: relay-node-016-${{ github.event.inputs.day_override }}
+  cancel-in-progress: false
+
+jobs:
+  brush:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(format('[{0}]', github.event.inputs.only_slices)) }}
+    env:
+      # ---- 分片身份：全部来自 dispatch 入参，不用本仓自己算（ns 全局唯一是硬约束 #1）----
+      NS: ${{ github.event.inputs.ns_override }}
+      SLICE: ${{ matrix.slice }}
+      ASSIGN_DAY: ${{ github.event.inputs.day_override }}
+      # master plan 算出的 PAR；'|| 24' 兜底：忘传时落 24 而不是 run.py 的默认 3
+      ACCOUNT_PARALLEL: ${{ github.event.inputs.par_override || '24' }}
+      # ---- 以下 env 与主仓 run.yml brush 段逐项对照（2026-11-13，缺了以主仓为准）----
+      # 2026-11-10 更正：ASSIGN_ON 废弃回退语义，置 0 = 每片 no_assign.marker + exit 1。必须保持 '1'。
+      ASSIGN_ON: '1'
+      WORKER_URL: 'https://xx1031.xyz'
+      PEER_WORKER_URL: 'https://dingzhi.xx1031.xyz'
+      NB_PASS: ${{ secrets.NB_PASS }}
+      ASSIGN_PASS: ${{ secrets.ASSIGN_PASS }}   # /api/assign 独立口令，缺了整片 503
+      PEER_KEY: ${{ secrets.PEER_KEY }}
+      ADMIN_PASS: ${{ secrets.ADMIN_PASS }}     # 删号上报
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_AUTH_CODE: ${{ secrets.EMAIL_AUTH_CODE }}
+      # NB_POOL_1..40 不配：11-06 已删 Secrets 回退路径，配了也不用（§5.4）
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xm921016/cron-relay      # 跨仓取代码
+          ref: main
+          path: src
+          # 主仓 public 本不需要 token，保留 RELAY_SRC_TOKEN 防主仓将来转 private
+          token: ${{ secrets.RELAY_SRC_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q pycryptodome requests pillow
+      - name: install CJK fonts (notes.py 笔记图片中文字体)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-arphic-uming fonts-noto-cjk
+      - name: stagger start
+        run: sleep $((RANDOM % 240 + 60))   # 错开各片启动，避免同刻批量特征
+      - name: run slice
+        working-directory: src
+        run: python run.py
+      # ---- 日常三步 continue-on-error，语义与主仓一致：失败不整片重跑（防播放翻倍）----
+      - name: build accounts for signin/notes
+        id: mkacc
+        continue-on-error: true
+        working-directory: src
+        run: python make_accounts.py
+      - name: daily signin
+        id: signin
+        continue-on-error: true
+        working-directory: src
+        run: |
+          N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
+          if [ "$N" -gt 0 ]; then python signin.py; else echo "本片无账号，跳过签到"; fi
+      - name: notes publish
+        id: notes
+        continue-on-error: true
+        working-directory: src
+        run: |
+          N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
+          if [ "$N" -gt 0 ]; then python notes.py; else echo "本片无账号，跳过笔记"; fi
+      - name: mark signin/notes failures (不重跑本片)
+        if: always()
+        env:
+          MKACC_OUTCOME: ${{ steps.mkacc.outcome }}
+          SIGNIN_OUTCOME: ${{ steps.signin.outcome }}
+          NOTES_OUTCOME: ${{ steps.notes.outcome }}
+        run: |
+          echo "取号=$MKACC_OUTCOME 签到=$SIGNIN_OUTCOME 笔记=$NOTES_OUTCOME"
+          if [ "$MKACC_OUTCOME" != "success" ] || [ "$SIGNIN_OUTCOME" != "success" ] || [ "$NOTES_OUTCOME" != "success" ]; then
+            echo "::error::本片签到/笔记/取号未全部成功（播放已完成，故意不让 job 失败，避免 guard 整片重播）"
+          fi
+      # 2026-11-06 语义同步：没领到 D1 分配名单一律让 job 失败，交给 backfill 精确补跑
+      - name: fail if no D1 assignment（不回退老名单）
+        if: always()
+        working-directory: src
+        run: |
+          if [ -f no_assign.marker ]; then
+            echo "::error::本片没有拿到 D1 分配名单，已跳过。"
+            cat no_assign.marker
+            exit 1
+          fi
+      - name: warn if all accounts unknown（整片号全部无法判定）
+        if: always()
+        working-directory: src
+        run: |
+          if [ -f slice_all_unknown.marker ]; then
+            echo "::warning::本片号全部「网络异常无法判定」，本次未播放，建议人工确认网易侧是否限流。"
+            cat slice_all_unknown.marker
+          fi
+      - name: upload diag
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-slice-${{ matrix.slice }}
+          path: src/diag_logs/
+          if-no-files-found: ignore
