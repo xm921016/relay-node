@@ -79,54 +79,13 @@ jobs:
         working-directory: src
         run: python run.py
       # ---- 日常三步 continue-on-error，语义与主仓一致：失败不整片重跑（防播放翻倍）----
-      - name: build accounts for signin/notes
-        id: mkacc
+      # 2026-11-18 收敛：日常四步（取号/签到/笔记/失败标记）定义收敛到主仓 composite action，
+      # 改口径只改主仓 .github/actions/daily-tasks/action.yml，本仓不再维护步骤体
+      # （11-18 教训：主仓 11-15 改签到白名单，本仓 run.yml 漏跟 → 全量签到 3 天）。
+      - name: daily tasks (mkacc+signin+notes, defined in master repo)
+        id: daily
+        uses: ./src/.github/actions/daily-tasks
         continue-on-error: true
-        working-directory: src
-        run: python make_accounts.py
-      - name: daily signin
-        id: signin
-        continue-on-error: true
-        working-directory: src
-        run: |
-          # 2026-11-18 对齐主仓 11-15 口径（用户指示）：只保留大号 17316702006 签到，
-          # 其余号停用（核心=播放量，其余号只有 刷播放量+发笔记）。
-          # signin.py 跨仓 checkout 自主仓，已支持 SIGNIN_CONFIG（主仓 2026-11-15 加）。
-          python - <<'PY'
-          import json
-          cfg = json.load(open('accounts.json', encoding='utf-8'))
-          keep = [a for a in cfg.get('accounts', []) if str(a.get('name')) == '17316702006']
-          for a in keep:
-              a['roles'] = 'signin'
-          cfg['accounts'] = keep
-          cfg['source'] = 'Secrets'
-          json.dump(cfg, open('accounts_signin.json', 'w', encoding='utf-8'), ensure_ascii=False)
-          print('signin 大号命中:', len(keep))
-          PY
-          N=$(python -c "import json;print(len(json.load(open('accounts_signin.json'))['accounts']))")
-          if [ "$N" -gt 0 ]; then
-            SIGNIN_CONFIG=accounts_signin.json python signin.py
-          else
-            echo "本片无大号 17316702006，跳过签到（2026-11-15 起只保留大号签到）"
-          fi
-      - name: notes publish
-        id: notes
-        continue-on-error: true
-        working-directory: src
-        run: |
-          N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
-          if [ "$N" -gt 0 ]; then python notes.py; else echo "本片无账号，跳过笔记"; fi
-      - name: mark signin/notes failures (不重跑本片)
-        if: always()
-        env:
-          MKACC_OUTCOME: ${{ steps.mkacc.outcome }}
-          SIGNIN_OUTCOME: ${{ steps.signin.outcome }}
-          NOTES_OUTCOME: ${{ steps.notes.outcome }}
-        run: |
-          echo "取号=$MKACC_OUTCOME 签到=$SIGNIN_OUTCOME 笔记=$NOTES_OUTCOME"
-          if [ "$MKACC_OUTCOME" != "success" ] || [ "$SIGNIN_OUTCOME" != "success" ] || [ "$NOTES_OUTCOME" != "success" ]; then
-            echo "::error::本片签到/笔记/取号未全部成功（播放已完成，故意不让 job 失败，避免 guard 整片重播）"
-          fi
       # 2026-11-06 语义同步：没领到 D1 分配名单一律让 job 失败，交给 backfill 精确补跑
       - name: fail if no D1 assignment（不回退老名单）
         if: always()
