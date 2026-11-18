@@ -89,8 +89,26 @@ jobs:
         continue-on-error: true
         working-directory: src
         run: |
-          N=$(python -c "import json;print(len(json.load(open('accounts.json'))['accounts']))")
-          if [ "$N" -gt 0 ]; then python signin.py; else echo "本片无账号，跳过签到"; fi
+          # 2026-11-18 对齐主仓 11-15 口径（用户指示）：只保留大号 17316702006 签到，
+          # 其余号停用（核心=播放量，其余号只有 刷播放量+发笔记）。
+          # signin.py 跨仓 checkout 自主仓，已支持 SIGNIN_CONFIG（主仓 2026-11-15 加）。
+          python - <<'PY'
+          import json
+          cfg = json.load(open('accounts.json', encoding='utf-8'))
+          keep = [a for a in cfg.get('accounts', []) if str(a.get('name')) == '17316702006']
+          for a in keep:
+              a['roles'] = 'signin'
+          cfg['accounts'] = keep
+          cfg['source'] = 'Secrets'
+          json.dump(cfg, open('accounts_signin.json', 'w', encoding='utf-8'), ensure_ascii=False)
+          print('signin 大号命中:', len(keep))
+          PY
+          N=$(python -c "import json;print(len(json.load(open('accounts_signin.json'))['accounts']))")
+          if [ "$N" -gt 0 ]; then
+            SIGNIN_CONFIG=accounts_signin.json python signin.py
+          else
+            echo "本片无大号 17316702006，跳过签到（2026-11-15 起只保留大号签到）"
+          fi
       - name: notes publish
         id: notes
         continue-on-error: true
